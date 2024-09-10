@@ -20,8 +20,12 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 # Initialize OpenAI API key
-os.environ['OPENAI_API_KEY'] = keyring.get_password('eastridge', 'openai')
-openai.api_key = os.getenv('OPENAI_API_KEY')
+# os.environ['OPENAI_API_KEY'] = keyring.get_password('eastridge', 'openai')
+# openai.api_key = os.getenv('OPENAI_API_KEY')
+
+openai_api_key = st.secrets["openai"]["api_key"]
+os.environ["OPENAI_API_KEY"] = openai_api_key
+openai.api_key = openai_api_key
 
 # Setup audio recording parameters
 FORMAT = pyaudio.paInt16
