@@ -8,5 +8,6 @@ numpy
 tenacity
 langchain
 keyring
-email
 python-docx
+setuptools
+wheels
