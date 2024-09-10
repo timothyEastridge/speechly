@@ -1,9 +1,13 @@
 streamlit
 openai
-langchain
-pyaudio
-wave
-tenacity
 pandas
 plotly
+pyaudio
+wave
 numpy
+tenacity
+langchain
+keyring
+smtplib
+email
+python-docx
