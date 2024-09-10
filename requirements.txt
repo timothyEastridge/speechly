@@ -8,6 +8,5 @@ numpy
 tenacity
 langchain
 keyring
-smtplib
 email
 python-docx
