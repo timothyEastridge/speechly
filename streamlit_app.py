@@ -1,198 +1,292 @@
-import streamlit as st
+import os
 import pandas as pd
-import plotly.graph_objects as go
+import streamlit as st
 from datetime import datetime, timedelta
+import pyaudio
+import wave
+import openai
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
+import plotly.graph_objects as go
+import numpy as np
+from tempfile import NamedTemporaryFile
+import keyring
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 
-# Set page config
-st.set_page_config(page_title="Health Dashboard", layout="wide")
+# Initialize OpenAI API key
+os.environ['OPENAI_API_KEY'] = keyring.get_password('eastridge', 'openai')
+openai.api_key = os.getenv('OPENAI_API_KEY')
 
-# Custom CSS to style the app
+# Setup audio recording parameters
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
+CHUNK = 1024
+RECORD_SECONDS = 8
+
+# Custom CSS for app styling
 st.markdown("""
 <style>
-    .stApp {
-        max-width: 400px;
-        margin: 0 auto;
-        font-family: 'Arial', sans-serif;
-    }
-    .main {
+    .reportview-container .main .block-container {
+        max-width: 1200px;
         padding: 2rem;
-        background-color: #f0f2f6;
-        border-radius: 20px;
-    }
-    .header {
-        font-size: 24px;
-        font-weight: bold;
-        margin-bottom: 10px;
-    }
-    .date {
-        color: #888;
-        font-size: 14px;
-        margin-bottom: 20px;
-    }
-    .calendar {
-        display: flex;
-        justify-content: space-between;
-        margin-bottom: 20px;
-    }
-    .day {
-        text-align: center;
-        font-size: 12px;
-    }
-    .current-day {
-        background-color: #000;
-        color: #fff;
-        border-radius: 50%;
-        width: 24px;
-        height: 24px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-    }
-    .mic-button {
-        background-color: #4CAF50;
-        color: white;
-        padding: 10px;
+        border: 2px solid #333333;
         border-radius: 10px;
-        text-align: center;
-        margin-bottom: 20px;
+        margin: 2rem auto;
     }
-    .metric-container {
-        display: flex;
-        justify-content: space-between;
-        margin-bottom: 20px;
+    .dataframe {
+        width: 100% !important;
     }
-    .metric {
-        text-align: center;
-        flex: 1;
-        padding: 10px;
-        border-radius: 10px;
-        margin: 5px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    .dataframe td:nth-child(2) {
+        min-width: 300px !important;
     }
-    .metric-title {
-        font-size: 12px;
-        color: #888;
-    }
-    .metric-value {
+    .stButton > button {
+        width: 200px;
+        height: 200px;  /* Increased height to make it more square-like */
+        background-color: #FFCCCB;  /* Light red background */
+        color: black;  /* Changed text color to black for better contrast */
         font-size: 18px;
-        font-weight: bold;
-    }
-    .stat-box {
-        background-color: white;
-        border-radius: 10px;
-        padding: 10px;
-        margin-bottom: 10px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-    }
-    .stat-title {
-        font-size: 12px;
-        color: #888;
-    }
-    .stat-value {
-        font-size: 18px;
-        font-weight: bold;
-    }
-    .footer {
-        position: fixed;
-        bottom: 0;
-        left: 0;
-        right: 0;
-        background-color: white;
-        padding: 10px;
-        text-align: center;
-        box-shadow: 0 -2px 5px rgba(0,0,0,0.1);
+        display: block;
+        margin: 0 auto;
+        border-radius: 50%;  /* Makes the button circular */
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Main content
-st.markdown('<div class="main">', unsafe_allow_html=True)
+# Initialize the GPT model for calorie estimation and meal type classification
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def create_chat_llm():
+    return ChatOpenAI(temperature=0.0, model="gpt-4o")
 
-# Header
-st.markdown('<div class="header">Hello, Tim</div>', unsafe_allow_html=True)
+chat_llm = create_chat_llm()
 
-# Date
-today = datetime.now()
-st.markdown(f'<div class="date">{today.strftime("%B %d, %Y")}</div>', unsafe_allow_html=True)
+# Define the prompt template for calorie estimation and meal type classification
+calories_prompt_template = """
+Analyze the following meal description and provide two pieces of information:
+1. Estimate the number of calories for this meal. Reply with NUMBER only in 1-3 tokens. If unsure, reply with "0".
+2. Classify the meal type (Breakfast, Lunch, Dinner, or Snack).
 
-# Calendar week view
-week_days = [(today + timedelta(days=i)).strftime('%a') for i in range(7)]
-week_dates = [(today + timedelta(days=i)).day for i in range(7)]
-st.markdown('<div class="calendar">', unsafe_allow_html=True)
-for i, (day, date) in enumerate(zip(week_days, week_dates)):
-    day_class = "current-day" if i == 0 else ""
-    st.markdown(f"""
-    <div class="day">
-        <div>{day}</div>
-        <div class="{day_class}">{date}</div>
-    </div>
-    """, unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
+Reply with ONLY these two pieces of information, separated by a comma. For example: "500, Lunch" or "2500, Snack".
+If unsure about the calories, use your best estimate.
 
-# Microphone button
-st.markdown('<div class="mic-button">🎤</div>', unsafe_allow_html=True)
+Meal description: {meal_description}
+"""
 
-# Metrics
-st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-metrics = [
-    {"name": "Meals", "value": 45, "color": "#4CAF50"},
-    {"name": "Activity", "value": 75, "color": "#FFA500"},
-    {"name": "Mood", "value": 100, "color": "#2196F3"}
-]
-for metric in metrics:
-    st.markdown(f"""
-    <div class="metric" style="background-color: {metric['color']}22;">
-        <div class="metric-title">{metric['name']}</div>
-        <div class="metric-value">{metric['value']}%</div>
-    </div>
-    """, unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
+calories_prompt = PromptTemplate(template=calories_prompt_template, input_variables=["meal_description"])
+calories_chain = LLMChain(llm=chat_llm, prompt=calories_prompt)
 
-# Health stats
-col1, col2 = st.columns(2)
-with col1:
-    st.markdown("""
-    <div class="stat-box">
-        <div class="stat-title">Protein Intake</div>
-        <div class="stat-value">82g</div>
-    </div>
-    """, unsafe_allow_html=True)
-with col2:
-    st.markdown("""
-    <div class="stat-box">
-        <div class="stat-title">Daily Calories</div>
-        <div class="stat-value">859 KCal</div>
-    </div>
-    """, unsafe_allow_html=True)
+# Function to generate calorie estimate and meal type using GPT
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def estimate_calories_and_type(transcription_text):
+    data = {"meal_description": transcription_text}
+    try:
+        response_dict = calories_chain.invoke(data)
+        response_text = response_dict.get('text', '').strip()
+        calories, meal_type = response_text.split(',')
+        return calories.strip(), meal_type.strip()
+    except Exception:
+        return '0', 'Unknown'
 
-# Steps chart
-steps_data = {
-    'Day': ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
-    'Steps': [2000, 5000, 7000, 8000, 6000, 7500, 9000]
-}
-df = pd.DataFrame(steps_data)
+# Audio recording function with temporary file path
+def record_audio():
+    audio = pyaudio.PyAudio()
+    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+    frames = []
 
-fig = go.Figure()
-fig.add_trace(go.Bar(
-    x=df['Day'],
-    y=df['Steps'],
-    marker_color='#4CAF50'
-))
-fig.update_layout(
-    title='Average Steps',
-    yaxis_title='Steps',
-    plot_bgcolor='white',
-    showlegend=False,
-    height=300,
-    margin=dict(l=0, r=0, t=30, b=0)
-)
-st.plotly_chart(fig, use_container_width=True)
+    for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
+        data = stream.read(CHUNK)
+        frames.append(data)
 
-st.markdown('</div>', unsafe_allow_html=True)
+    stream.stop_stream()
+    stream.close()
+    audio.terminate()
 
-# Bottom navigation
-st.markdown("""
-<div class="footer">
-    🏠 📷 📊
-</div>
-""", unsafe_allow_html=True)
+    timestamp = datetime.now()
+    temp_file = NamedTemporaryFile(delete=False, suffix=".wav")
+    filepath = temp_file.name
+
+    with wave.open(filepath, 'wb') as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(audio.get_sample_size(FORMAT))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
+
+    return filepath, timestamp
+
+def transcribe_audio(filepath):
+    try:
+        with open(filepath, 'rb') as audio_file:
+            transcript = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+            return transcript.text
+    except Exception as e:
+        st.error(f"Transcription failed: {str(e)}")
+        return None
+
+# Email sending function
+def send_email(to_address, subject, body):
+    try:
+        from_address = os.getenv('EMAIL_ADDRESS')
+        password = os.getenv('EMAIL_PASSWORD')
+
+        message = MIMEMultipart()
+        message['From'] = from_address
+        message['To'] = to_address
+        message['Subject'] = subject
+
+        message.attach(MIMEText(body, 'plain'))
+
+        with smtplib.SMTP('smtp.gmail.com', 587) as session:
+            session.starttls()
+            session.login(from_address, password)
+            text = message.as_string()
+            session.sendmail(from_address, to_address, text)
+
+        st.success("Email sent successfully!")
+    except Exception as e:
+        st.error(f"Error sending email: {str(e)}")
+
+# Function to load mock data for the last 3 days
+def load_mock_data():
+    end_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(days=3)
+    
+    mock_data = []
+    meal_types = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
+    
+    current_date = start_date
+    while current_date < end_date:
+        for meal in meal_types:
+            timestamp = current_date + timedelta(hours=np.random.randint(6, 22))
+            calories = np.random.randint(200, 800)
+            mock_data.append({
+                "Timestamp": timestamp,
+                "Transcription": f"{meal.lower()}",
+                "Calories": calories,
+                "MealType": meal
+            })
+        current_date += timedelta(days=1)
+    
+    today = datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
+    mock_data.append({
+        "Timestamp": today,
+        "Transcription": "Bowl of Cheerios and a yogurt",
+        "Calories": 250,
+        "MealType": "Breakfast"
+    })
+    
+    return pd.DataFrame(mock_data)
+
+# Function to create stacked bar chart
+def create_stacked_bar_chart(df):
+    df_copy = df.copy()
+    
+    df_copy['Date'] = df_copy['Timestamp'].dt.date
+    df_copy['MealType'] = pd.Categorical(df_copy['MealType'], categories=['Breakfast', 'Lunch', 'Dinner', 'Snack'], ordered=True)
+    daily_data = df_copy.groupby(['Date', 'MealType'])['Calories'].sum().unstack(fill_value=0)
+
+    daily_totals = daily_data.sum(axis=1)
+
+    fig = go.Figure()
+
+    colors = {'Breakfast': '#FFA07A', 'Lunch': '#98FB98', 'Dinner': '#87CEFA', 'Snack': '#DDA0DD'}
+
+    for meal_type in daily_data.columns:
+        fig.add_trace(go.Bar(
+            x=daily_data.index,
+            y=daily_data[meal_type],
+            name=meal_type,
+            marker_color=colors[meal_type]
+        ))
+
+    for date, total in daily_totals.items():
+        fig.add_annotation(
+            x=date,
+            y=total,
+            text=f"{total:.0f}",
+            showarrow=False,
+            yshift=10,
+            font=dict(size=12, color="black")
+        )
+
+    fig.update_layout(
+        title='Daily Calorie Intake by Meal Type',
+        barmode='stack',
+        xaxis_title='Date',
+        yaxis_title='Calories',
+        legend_title='Meal Type',
+        height=600
+    )
+
+    return fig
+
+def main():
+    if 'df' not in st.session_state:
+        st.session_state.df = load_mock_data()
+    
+    today = datetime.now().date()
+    if 'initial_data_cleaned' not in st.session_state:
+        st.session_state.df = st.session_state.df[
+            (st.session_state.df['Timestamp'].dt.date < today) | 
+            ((st.session_state.df['Timestamp'].dt.date == today) & 
+             (st.session_state.df['MealType'] == 'Breakfast') &
+             (st.session_state.df['Transcription'] == "Bowl of Cheerios and a yogurt"))
+        ]
+        st.session_state.initial_data_cleaned = True
+
+    # Center the "Record Audio" button
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        if st.button("Record Audio", key="record_audio_btn"):
+            with st.spinner("Recording audio..."):
+                audio_file_path, timestamp = record_audio()
+            
+            if audio_file_path:
+                with st.spinner("Transcribing audio..."):
+                    transcription = transcribe_audio(audio_file_path)
+                
+                if transcription:
+                    with st.spinner("Estimating calories and meal type..."):
+                        calories, meal_type = estimate_calories_and_type(transcription)
+
+                    new_entry = pd.DataFrame({
+                        "Timestamp": [timestamp],
+                        "Transcription": [transcription],
+                        "Calories": [int(calories)],
+                        "MealType": [meal_type]
+                    })
+                    st.session_state.df = pd.concat([st.session_state.df, new_entry], ignore_index=True)
+
+                    st.success(f"Recorded: {transcription}")
+                    st.info(f"Estimated Calories: {calories}, Meal Type: {meal_type}")
+    
+    # Create and display the stacked bar chart
+    fig = create_stacked_bar_chart(st.session_state.df)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Display the dataframe
+    sorted_df = st.session_state.df.sort_values(by='Timestamp', ascending=False)
+    display_df = sorted_df[['Timestamp', 'Transcription', 'Calories', 'MealType']]
+    display_df['Timestamp'] = display_df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    st.dataframe(
+        display_df.style.hide(axis="index"),
+        width=1200,
+        height=400
+    )
+
+    # Email Input Box at the Bottom
+    email = st.text_input("Enter your email (optional):")
+    if email:
+        send_email(email, "Your Meal Data", "Thank you for using the app. Here is your meal data.")
+
+if __name__ == "__main__":
+    main()
